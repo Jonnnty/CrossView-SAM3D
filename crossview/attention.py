@@ -3,11 +3,11 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from crossview.constants import ATTN_CHUNK, DROP, NGRID, PAIR, RGB_LEN
+from crossview.constants import ATTN_CHUNK, NGRID, RGB_LEN
 
 
-def _patch_index(view: int, nkeys: int, device, base: int) -> torch.Tensor:
-    idx = torch.arange(1, 1 + NGRID * NGRID, device=device, dtype=torch.long) + view * PAIR + base
+def _patch_index(view: int, nkeys: int, device, base: int, stride: int) -> torch.Tensor:
+    idx = torch.arange(1, 1 + NGRID * NGRID, device=device, dtype=torch.long) + view * stride + base
     return idx[idx < nkeys]
 
 
@@ -24,6 +24,20 @@ def response_grid(q, k, v, lse, bias, idx) -> np.ndarray:
         contrib = torch.einsum("blhk,bkhd->blhkd", weight, ve)
         acc.append(contrib.norm(dim=-1).mean(dim=(0, 1, 2)))
         del logits, weight, ve, contrib
+    return torch.cat(acc).reshape(NGRID, NGRID).detach().cpu().numpy().astype(np.float32)
+
+
+def probability_grid(q, k, lse, bias, idx) -> np.ndarray:
+    scale = q.shape[-1] ** -0.5
+    qf = q.float() * scale
+    acc = []
+    for s in range(0, idx.shape[0], 256):
+        ii = idx[s : s + 256]
+        logits = torch.einsum("blhd,bkhd->blhk", qf, k.float().index_select(1, ii))
+        logits = logits + bias.index_select(0, ii).view(1, 1, 1, -1)
+        weight = torch.exp(logits - lse.unsqueeze(-1))
+        acc.append(weight.mean(dim=(0, 1, 2)))
+        del logits, weight
     return torch.cat(acc).reshape(NGRID, NGRID).detach().cpu().numpy().astype(np.float32)
 
 
@@ -73,6 +87,7 @@ def layer_mean(rows: list[tuple[int, np.ndarray]]) -> np.ndarray:
 
 def install_rgb_attention_equalization(backbone, states, holder: dict):
     saved = []
+    stride = int(holder["stride"])
     for bi, block in enumerate(backbone.blocks):
         attn = block.cross_attn["shape"]
         orig = attn.forward
@@ -87,17 +102,18 @@ def install_rgb_attention_equalization(backbone, states, holder: dict):
                 for view, state in enumerate(states):
                     if not state.apply_b:
                         continue
-                    idx = _patch_index(view, lkv, x.device, 0)
+                    idx = _patch_index(view, lkv, x.device, 0, stride)
                     flat = torch.from_numpy(state.B.reshape(-1)[: idx.numel()]).to(x.device)
                     bias.index_copy_(0, idx[: flat.numel()], flat)
-            if holder["drop"]:
-                a = int(holder["segment"]) * PAIR
-                b = min(a + PAIR, lkv)
-                bias[a:b] = DROP
             out, lse = _attend(q, k, v, bias)
             for view, state in enumerate(states):
                 if state.record:
-                    state.rows.append((bi + 1, response_grid(q, k, v, lse, bias, _patch_index(view, lkv, x.device, 0))))
+                    idx = _patch_index(view, lkv, x.device, 0, stride)
+                    state.rows.append((bi + 1, response_grid(q, k, v, lse, bias, idx)))
+            if holder.get("capture"):
+                for view in range(len(states)):
+                    idx = _patch_index(view, lkv, x.device, RGB_LEN, stride)
+                    holder["sink"].append((view, bi + 1, probability_grid(q, k, lse, bias, idx)))
             return attn.to_out(out.reshape(x.shape[0], x.shape[1], channels).to(x.dtype))
 
         attn.forward = forward
@@ -105,7 +121,7 @@ def install_rgb_attention_equalization(backbone, states, holder: dict):
     return saved
 
 
-def install_mask_stream_alignment(backbone, states):
+def install_share_alignment(backbone, holder: dict):
     saved = []
     for bi, block in enumerate(backbone.blocks):
         attn = block.cross_attn["shape"]
@@ -117,17 +133,15 @@ def install_mask_stream_alignment(backbone, states):
             q, k, v, channels = _qkv(attn, x, context)
             lkv = context.shape[1]
             bias = torch.zeros(lkv, device=x.device, dtype=torch.float32)
-            for state in states:
-                if not state.apply_b:
-                    continue
-                idx = _patch_index(0, lkv, x.device, RGB_LEN)
-                flat = torch.from_numpy(state.B.reshape(-1)[: idx.numel()]).to(x.device)
+            idx = _patch_index(0, lkv, x.device, RGB_LEN, lkv)
+            if holder["apply"]:
+                flat = torch.from_numpy(holder["align"].bias(bi).reshape(-1)[: idx.numel()]).to(
+                    device=x.device, dtype=torch.float32
+                )
                 bias.index_copy_(0, idx[: flat.numel()], flat)
             out, lse = _attend(q, k, v, bias)
-            for state in states:
-                if state.record:
-                    idx = _patch_index(0, lkv, x.device, RGB_LEN)
-                    state.rows.append((bi + 1, response_grid(q, k, v, lse, bias, idx)))
+            if holder["record"]:
+                holder["sink"].append((bi, probability_grid(q, k, lse, bias, idx)))
             return attn.to_out(out.reshape(x.shape[0], x.shape[1], channels).to(x.dtype))
 
         attn.forward = forward

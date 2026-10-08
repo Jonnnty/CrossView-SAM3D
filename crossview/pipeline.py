@@ -11,20 +11,20 @@ from PIL import Image
 
 from sam3d_objects.model.backbone.generator.flow_matching.solver import linear_approximation_step
 
-from crossview.attention import install_mask_stream_alignment, layer_mean, restore
-from crossview.connected_component import largest_26_connected_component
-from crossview.constants import RGB_LEN, SEED, STEPS
-from crossview.discrepancy_fusion import (
+from crossview.attention import install_share_alignment, restore
+from crossview.constants import SIDE, STEPS, VIEW_LEN
+from crossview.gap_fusion import (
     _detach,
     _noise,
-    collect_leave_one_out_shape_speeds,
-    discrepancy_weighted_velocity_fusion,
+    gap_fusion_weight,
+    reference_mask_shares,
+    shape_speed_gap,
+    weighted_velocity_fusion,
 )
-from crossview.equalization_discrepancy import discrepancy_fusion_weight, equalization_discrepancy
-from crossview.mask_stream_alignment import AlignmentState, mask_stream_alignment
 from crossview.render import render_five_views
 from crossview.rgb_attention_equalization import EqualizationState
-from crossview.structural_target import mask_support, structural_target
+from crossview.share_alignment import ShareAlignment, aligned_dynamics, reference_dynamics
+from crossview.structural_target import mask_support
 from crossview.structured_latent_fusion import align_occupancy, structured_latent_fusion
 
 
@@ -145,42 +145,43 @@ def _primary_occupancy(gen, decoder, latent_shape, condition) -> np.ndarray:
     return _occupancy(decoder, x)
 
 
-def _fuse(gen, decoder, backbone, latent_shape, conditions, support, target, salient, weight):
-    states = []
-    for _cond in conditions:
-        state = AlignmentState(support, target, salient)
-        state.salient = salient
-        states.append(state)
-    saved = install_mask_stream_alignment(backbone, states)
+def _fuse(gen, decoder, backbone, latent_shape, conditions, states):
+    holder = {"align": states[0], "sink": [], "apply": False, "record": False}
+    saved = install_share_alignment(backbone, holder)
     x = _noise(gen, latent_shape, conditions[0].device)
     t_seq, d_val = gen._prepare_t_and_d()
-    w = torch.as_tensor(weight.reshape(weight.shape[0], -1), device=conditions[0].device)
+    weight = None
     try:
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float32):
             for step, (t_a, t_b) in enumerate(zip(t_seq[:STEPS], t_seq[1 : STEPS + 1]), start=1):
-                velocities = []
-                for cond, state in zip(conditions, states):
-                    for other in states:
-                        other.apply_b = False
-                        other.record = False
-                        other.rows = []
-                    state.apply_b = True
-                    state.record = True
-                    velocities.append(gen._generate_dynamics(x, float(t_a), d_val, cond))
-                    if state.rows:
-                        mask_stream_alignment(state, layer_mean(state.rows))
-                for state in states:
-                    state.apply_b = False
-                    state.record = False
-                x = _detach(linear_approximation_step(x, float(t_b - t_a), discrepancy_weighted_velocity_fusion(velocities, w)))
-                del velocities
-                if step in (1, STEPS):
-                    print(json.dumps({"fusion_step": step}), flush=True)
+                aligned = []
+                for view, cond in enumerate(conditions):
+                    aligned.append(aligned_dynamics(gen, x, t_a, d_val, cond, states[view], holder, step, view))
+                gaps = []
+                for view, cond in enumerate(conditions):
+                    reference = reference_dynamics(gen, x, t_a, d_val, cond, holder)
+                    gaps.append(shape_speed_gap(aligned[view], reference))
+                    del reference
+                weight = gap_fusion_weight(np.stack(gaps))
+                w = torch.as_tensor(weight.reshape(len(conditions), -1), device=conditions[0].device)
+                mixed = weighted_velocity_fusion(aligned, w)
+                x = _detach(linear_approximation_step(x, float(t_b - t_a), mixed))
+                print(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "weight_mean": [float(v) for v in weight.mean(axis=(1, 2, 3))],
+                            "weight_min": [float(v) for v in weight.reshape(len(conditions), -1).min(1)],
+                        }
+                    ),
+                    flush=True,
+                )
+                del aligned, mixed
                 torch.cuda.empty_cache()
         occ = _occupancy(decoder, x)
     finally:
         restore(saved)
-    return occ
+    return occ, weight
 
 
 def run_object(pipeline, folder: Path, out: Path) -> None:
@@ -199,40 +200,47 @@ def run_object(pipeline, folder: Path, out: Path) -> None:
     embedded = [_embed(pipeline, photo, mask) for photo, mask in zip(photos, masks)]
     for emb in pipeline.condition_embedders.values():
         emb.cpu()
+    _place_depth(pipeline, False)
     torch.cuda.empty_cache()
-    own = [torch.cat([cond[:, :RGB_LEN], cond[:, RGB_LEN : 2 * RGB_LEN]], dim=1) for cond in embedded]
-    mask1 = embedded[0][:, RGB_LEN : 2 * RGB_LEN]
-    aligned = [torch.cat([cond[:, :RGB_LEN], mask1], dim=1) for cond in embedded]
-    concat = torch.cat(own, dim=1)
+    width = int(embedded[0].shape[1])
+    if any(int(cond.shape[1]) != width for cond in embedded) or width != VIEW_LEN:
+        raise RuntimeError(f"expected {VIEW_LEN} tokens per view, got {width}")
+    print(json.dumps({"object": folder.name, "tokens_per_view": width, "views": len(embedded)}), flush=True)
     gen = pipeline.models["ss_generator"]
     decoder = pipeline.models["ss_decoder"]
     backbone, latent_shape = _prepare(gen)
-    support, target = structural_target(pipeline, photos[0], masks[0])
-    _place_depth(pipeline, False)
-    salient = target.astype(bool) & support
-    print(json.dumps({"object": folder.name, "support": int(support.sum()), "salient": int(salient.sum())}), flush=True)
-    states = [EqualizationState(mask_support(photo, mask)) for photo, mask in zip(photos, masks)]
-    print("unregularized concat", flush=True)
-    raw_speeds, raw_latent = collect_leave_one_out_shape_speeds(gen, backbone, latent_shape, concat, states, False)
-    raw_occ = _occupancy(decoder, raw_latent)
-    states = [EqualizationState(mask_support(photo, mask)) for photo, mask in zip(photos, masks)]
-    print("equalized concat", flush=True)
-    eq_speeds, _eq_latent = collect_leave_one_out_shape_speeds(gen, backbone, latent_shape, concat, states, True)
-    weight = discrepancy_fusion_weight(equalization_discrepancy(eq_speeds, raw_speeds), raw_occ)
-    print(json.dumps({"weight_mean": [float(v) for v in weight.mean(axis=(1, 2, 3))]}), flush=True)
+    supports = [mask_support(photo, mask) for photo, mask in zip(photos, masks)]
+    print("equalized concatenation", flush=True)
+    shares = reference_mask_shares(
+        gen,
+        backbone,
+        latent_shape,
+        embedded,
+        [EqualizationState(support) for support in supports],
+    )
     print("primary view", flush=True)
-    reference = _primary_occupancy(gen, decoder, latent_shape, aligned[0])
-    print("discrepancy-weighted fusion", flush=True)
-    fused = _fuse(gen, decoder, backbone, latent_shape, aligned, support, target, salient, weight)
-    kept = largest_26_connected_component(fused)
-    print(json.dumps({"occupancy": int(len(fused)), "kept": int(len(kept))}), flush=True)
-    if len(kept) == 0:
+    reference = _primary_occupancy(gen, decoder, latent_shape, embedded[0])
+    print("gap-weighted fusion", flush=True)
+    states = [ShareAlignment(support, share) for support, share in zip(supports, shares)]
+    fused, weight = _fuse(gen, decoder, backbone, latent_shape, embedded, states)
+    print(json.dumps({"occupancy": int(len(fused))}), flush=True)
+    if len(fused) == 0 or weight is None:
         print(json.dumps({"stage2": "skipped", "reason": "empty occupancy"}), flush=True)
         return
-    tokens = np.clip(kept // 4, 0, 15)
+    tokens = np.clip(fused // 4, 0, SIDE - 1)
     point_w = weight[:, tokens[:, 0], tokens[:, 1], tokens[:, 2]]
-    coords, coord_w, snap, shift = align_occupancy(kept, point_w, reference)
-    print(json.dumps({"snap": snap, "shift": shift.tolist(), "aligned": int(len(coords))}), flush=True)
+    coords, coord_w, snap, shift = align_occupancy(fused, point_w, reference)
+    print(
+        json.dumps(
+            {
+                "snap": snap,
+                "shift": shift.tolist(),
+                "aligned": int(len(coords)),
+                "color_weight_mean": [float(v) for v in coord_w.mean(axis=1)],
+            }
+        ),
+        flush=True,
+    )
     for emb in pipeline.condition_embedders.values():
         emb.cuda()
     _park(pipeline, {"slat_generator", "slat_decoder_gs"})
